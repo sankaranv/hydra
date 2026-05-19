@@ -3,3 +3,13 @@
 .dolt/
 *.db
 .beads-credential-key
+.beads
+AGENTS.md
+CLAUDE.md
+.claude/
+.vscode/
+.DS_Store
+__pycache__
+reference/
+logs/
+scratch/
