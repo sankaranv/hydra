@@ -12,6 +12,15 @@ Key design constraints:
 - event_dim=2 throughout: all HookedGPT2 sites are [batch, seq, d_model];
   supports are built as IndependentConstraint(real, 2) to match the registration
 - first_available_dim=-8 accommodates event_dim=2 sites plus world dims
+
+Guide design (train_ac_guide):
+  SVI+REINFORCE is numerically unstable when soft_neq(v=v) = log(0) = -inf,
+  which occurs for non-causal sites where ablation leaves the consequent unchanged.
+  Instead, train_ac_guide uses importance sampling: n_steps forward passes from the
+  Categorical(2) prior over case variables, re-weighted by softmax(log_prob_sums).
+  Samples with -inf log_prob get weight 0 via softmax (no NaN). IS-weighted
+  P(case=0 | evidence) per site is stored as logits in pyro.param_store under
+  "guide_logits___cause____antecedent_{site}", read back by read_guide_verdict.
 """
 
 from typing import Callable, Optional
@@ -133,3 +142,119 @@ def run_ac_query(
         )
 
     return traces
+
+
+def train_ac_guide(
+    model_fn: Callable,
+    *model_args,
+    antecedents: dict[str, torch.Tensor],
+    alternatives: dict[str, torch.Tensor],
+    witnesses: Optional[dict[str, None]],
+    consequent_site: str,
+    consequent_value: torch.Tensor,
+    event_dim: int = 2,
+    consequent_scale: float = 0.1,
+    first_available_dim: int = -8,
+    n_steps: int = 300,
+    lr: float = 0.05,
+    prefix: str = "__cause__",
+) -> tuple[Callable, list[float]]:
+    """Estimate per-site PNS via importance sampling (IS) from the prior.
+
+    SVI+REINFORCE is numerically unstable when soft_neq(v=v) = log(0) = -inf,
+    which occurs for non-causal sites where ablation leaves the consequent
+    unchanged. IS handles -inf via softmax: those samples get weight 0 and
+    contribute nothing to the IS-weighted posterior.
+
+    Runs n_steps forward passes inside the SearchForExplanation context. Each
+    pass samples case variables from the Categorical(2) prior (case=0: intervention
+    active, case=1: factual/preempted). The trace log_prob_sum captures how well
+    each sample explains the observed consequent. IS weights = softmax(log_prob_sums).
+
+    IS-weighted P(case=0 | evidence) per antecedent site is stored as logits in
+    pyro.param_store() under "guide_logits_{prefix}__antecedent_{site}", which is
+    the key that read_guide_verdict() reads.
+
+    For a causal site: case=0 samples satisfy both necessity (soft_neq is high
+    because ablation changes the consequent) and sufficiency factors → high IS
+    weight → P(case=0) > 0.5.
+    For a non-causal site: case=0 samples have necessity factor = -inf (ablation
+    leaves the consequent unchanged) → IS weight = 0 → P(case=0) ≈ 0.
+
+    lr is unused (retained for API compatibility). Clears pyro.param_store()
+    before writing. Returns (dummy_guide, log_probs). Call read_guide_verdict()
+    after this to extract PNS estimates.
+    """
+
+    def site_support(t: torch.Tensor) -> constraints.Constraint:
+        if event_dim == 0:
+            return constraints.real
+        return constraints.independent(constraints.real, event_dim)
+
+    supports = {
+        **{site: site_support(v) for site, v in antecedents.items()},
+        consequent_site: site_support(consequent_value),
+    }
+
+    # Construct the case variable name that SearchForExplanation uses per antecedent.
+    case_var_name = {site: f"{prefix}__antecedent_{site}" for site in antecedents}
+
+    # Run n_steps prior samples, collecting case value and log_prob_sum per sample.
+    log_probs: list[float] = []
+    # site -> list of (sample_index, case_value) for samples that contained the case var
+    site_case_records: dict[str, list[tuple[int, int]]] = {s: [] for s in antecedents}
+
+    for i in range(n_steps):
+        with MultiWorldCounterfactual(first_available_dim=first_available_dim):
+            with SearchForExplanation(
+                supports=supports,
+                antecedents=antecedents,
+                consequents={consequent_site: consequent_value},
+                witnesses=witnesses,
+                alternatives=alternatives,
+                consequent_scale=consequent_scale,
+            ) as evidence:
+                with condition(data=evidence):
+                    trace = pyro.poutine.trace(model_fn).get_trace(*model_args)
+
+        log_probs.append(trace.log_prob_sum().item())
+
+        for site in antecedents:
+            cv = case_var_name[site]
+            if cv in trace.nodes:
+                site_case_records[site].append(
+                    (i, int(trace.nodes[cv]["value"].item()))
+                )
+
+    # IS weights via softmax — exp(-inf) = 0, so -inf samples are excluded automatically.
+    # When ALL log_probs are -inf, the necessity condition never fired: the antecedent
+    # did not cause the consequent to change in any world. Softmax would give nan (0/0),
+    # so we detect this case and default to P(case=0) = 0 (non-causal).
+    log_probs_t = torch.tensor(log_probs, dtype=torch.float64)
+    all_inf = not log_probs_t.isfinite().any().item()
+    is_weights = (
+        torch.zeros(len(log_probs), dtype=torch.float32)
+        if all_inf
+        else torch.softmax(log_probs_t, dim=0).float()
+    )
+
+    # Store IS-weighted P(case=0 | evidence) as logits in param_store.
+    pyro.clear_param_store()
+    for site in antecedents:
+        cv = case_var_name[site]
+        param_name = f"guide_logits_{cv}"
+        records = site_case_records[site]
+        if not records:
+            continue
+
+        p0 = float(sum(is_weights[idx].item() for idx, case in records if case == 0))
+        # Clamp to avoid degenerate logits from log(0) or log(1).
+        p0 = max(p0, 1e-6)
+        p0 = min(p0, 1.0 - 1e-6)
+        logits = torch.tensor([p0, 1.0 - p0], dtype=torch.float32).log()
+        pyro.get_param_store()[param_name] = logits
+
+    def dummy_guide(*args):
+        pass
+
+    return dummy_guide, log_probs

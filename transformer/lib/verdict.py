@@ -9,6 +9,7 @@ Case variable semantics (from chirho.explainable):
   2 = sufficiency world: antecedent restored to observed value
 """
 
+import pyro
 import torch
 
 
@@ -90,3 +91,41 @@ def summarize_verdict(
         )
         for site in antecedent_sites
     }
+
+
+def read_guide_verdict(
+    antecedent_sites: list[str],
+    prefix: str = "__cause__",
+) -> dict[str, dict]:
+    """Read per-site PNS from the guide parameters in pyro.param_store().
+
+    Reads logits stored by train_ac_guide() under the param key for each
+    antecedent's case variable, converts to probabilities via softmax, and
+    returns pns per site.
+
+    The case variables introduced by SearchForExplanation are Categorical(2):
+      case=0: intervention NOT preempted (antecedent in its causal world) — P(case=0) = PNS
+      case=1: intervention preempted (antecedent restored to factual)
+
+    Call this immediately after train_ac_guide() — pyro.clear_param_store() in
+    a subsequent train_ac_guide() call will erase these entries.
+
+    Sites missing from param_store (never trained) return pns=nan.
+    """
+    # Snapshot the param store at read time to avoid concurrent modification.
+    param_store = {k: v for k, v in pyro.get_param_store().items()}
+
+    result = {}
+    for site in antecedent_sites:
+        # The case variable name created by SearchForExplanation for this antecedent.
+        case_var_name = f"{prefix}__antecedent_{site}"
+        param_name = f"guide_logits_{case_var_name}"
+        if param_name not in param_store:
+            result[site] = {"pns": float("nan")}
+            continue
+        logits = param_store[param_name].detach()
+        probs = torch.softmax(logits, dim=-1)
+        # case=0: causally active (intervention not preempted) → PNS
+        result[site] = {"pns": probs[0].item()}
+
+    return result
