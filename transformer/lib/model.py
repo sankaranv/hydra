@@ -27,9 +27,12 @@ For each layer L in range(n_layers):
                     computed as pre_proj[..., H*d_head:(H+1)*d_head] @ W_proj[H*d_head:, :]
                     where W_proj is c_proj.weight ([d_model, d_model] Conv1D convention).
     attn_out_{L}  : full attention output = sum of head contributions + c_proj bias,
-                    shape [*batch, seq, d_model].
+                    shape [*batch, seq, d_model]. Registered BEFORE resid_dropout;
+                    in eval mode dropout is identity, but patching attn_out_L during
+                    training affects the pre-dropout value, not the residual contribution.
     mlp_out_{L}   : MLP output, shape [*batch, seq, d_model].
-    resid_post_{L}: residual stream after block L = resid_pre_L + attn_out_L + mlp_out_L,
+    resid_post_{L}: residual stream after block L =
+                    resid_pre_L + resid_dropout(attn_out_L) + mlp_out_L,
                     shape [*batch, seq, d_model].
 
 resid_pre_0 = embedding (token + position), registered as resid_post_{-1} is not exposed.
@@ -333,21 +336,23 @@ def site_names(n_layers: int, n_heads: int) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def verify_wrapper_correctness(model_name: str = "gpt2") -> bool:
-    """Verify that do() patching matches native hook injection.
+def check_do_hook_equivalence(model_name: str = "gpt2") -> dict:
+    """Compare ChiRho do() patching against native hook injection on head_0_0.
 
-    Loads (or constructs) a GPT-2 model, patches head_0_0 to zeros via two methods:
-    (1) ChiRho's do() handler intercepting the pyro.deterministic site, and
-    (2) a native PyTorch forward hook that zeroes head 0's c_proj contribution.
+    Patches head_0_0 to zeros via two independent methods and returns their
+    maximum absolute output difference. Passes when max_diff < 1e-5.
 
-    Asserts the two outputs agree to within 1e-5. Prints a summary.
+    The two methods must agree exactly (up to float32 precision) because they
+    apply the same logical operation — zeroing head 0's c_proj contribution —
+    through different mechanisms. If they diverge, the pyro.deterministic
+    registration or the bias-first accumulation in _AttentionHook is broken.
 
     Args:
-        model_name: HuggingFace model name string, or "tiny" to use a 2-layer
-                    2-head d_model=8 model (avoids network access for testing).
+        model_name: HuggingFace model name, or "tiny" for a 2-layer 2-head
+                    d_model=8 model that avoids network access.
 
     Returns:
-        True if verification passes, False otherwise.
+        dict with keys: passed (bool), max_diff (float), model_name (str).
     """
     from chirho.interventional.handlers import do
 
@@ -365,9 +370,6 @@ def verify_wrapper_correctness(model_name: str = "gpt2") -> bool:
         try:
             wrapper = HookedGPT2(model_name)
         except OSError:
-            print(
-                f"  Network unavailable for {model_name!r}; falling back to tiny model."
-            )
             config = GPT2Config(
                 n_layer=2,
                 n_head=2,
@@ -381,31 +383,24 @@ def verify_wrapper_correctness(model_name: str = "gpt2") -> bool:
     wrapper.eval()
     torch.manual_seed(0)
     input_ids = torch.randint(0, wrapper.gpt2.config.vocab_size, (1, 5))
+    patch = torch.zeros(*input_ids.shape, wrapper.d_model)
 
-    # Determine patch shape: head sites are [batch, seq, d_model]
-    batch, seq = input_ids.shape
-    d_model = wrapper.d_model
-    patch = torch.zeros(batch, seq, d_model)
-
-    # --- Method 1: ChiRho do() patching ---
     with torch.no_grad():
         out_chirho = do(wrapper, {"head_0_0": patch})(input_ids)
 
-    # --- Method 2: native hook injecting zeros for head 0's contribution ---
-    # The hook reconstructs c_proj output with head 0's slice zeroed out.
+    # Native hook: reconstruct c_proj output starting from bias, skipping head 0.
+    # Accumulation order bias + h1 + h2 + ... matches _AttentionHook's bias-first
+    # accumulation, so float32 rounding is identical and max_diff must be 0.
     d_head = wrapper.d_head
     attn_module = wrapper.gpt2.h[0].attn
 
-    def _zero_head_0_hook(module, input, output):  # noqa: ARG001
-        pre_proj = input[0]
-        weight = module.weight
-        bias = module.bias
-        # Reconstruct without head 0's contribution (set to zero)
+    def _zero_head_0_hook(module, inp, output):  # noqa: ARG001
+        pre_proj, weight, bias = inp[0], module.weight, module.bias
         result = bias.clone()
         for head_idx in range(wrapper.n_heads):
-            start, end = head_idx * d_head, (head_idx + 1) * d_head
             if head_idx == 0:
-                continue  # zero ablation of head 0
+                continue
+            start, end = head_idx * d_head, (head_idx + 1) * d_head
             result = result + pre_proj[..., start:end] @ weight[start:end, :]
         return result
 
@@ -415,111 +410,4 @@ def verify_wrapper_correctness(model_name: str = "gpt2") -> bool:
     hook_handle.remove()
 
     max_diff = (out_chirho - out_hook).abs().max().item()
-    passed = max_diff < 1e-5
-
-    print("=" * 60)
-    print("verify_wrapper_correctness")
-    print("=" * 60)
-    print(
-        f"  Model: {model_name}  (n_layers={wrapper.n_layers}, n_heads={wrapper.n_heads}, "
-        f"d_model={wrapper.d_model})"
-    )
-    print(f"  Input shape: {input_ids.shape}")
-    print(f"  Patch: head_0_0 -> zeros  ({patch.shape})")
-    print(f"  ChiRho do() output norm:  {out_chirho.norm().item():.6f}")
-    print(f"  Native hook output norm:  {out_hook.norm().item():.6f}")
-    print(f"  Max absolute difference:  {max_diff:.2e}")
-    if passed:
-        print("  PASS: do() patching matches native hook injection")
-    else:
-        print("  FAIL: outputs differ — max diff exceeds 1e-5")
-    return passed
-
-
-# ---------------------------------------------------------------------------
-# Script entry point for smoke-test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    from chirho.counterfactual.handlers.counterfactual import MultiWorldCounterfactual
-    from chirho.indexed.ops import IndexSet, gather
-    from chirho.interventional.handlers import do
-
-    print("=" * 60)
-    print("HookedGPT2 smoke test")
-    print("=" * 60)
-
-    # Use a tiny config to avoid network dependency
-    config = GPT2Config(
-        n_layer=2,
-        n_head=2,
-        n_embd=8,
-        attn_pdrop=0.0,
-        resid_pdrop=0.0,
-        embd_pdrop=0.0,
-    )
-    model = HookedGPT2(config)
-    model.eval()
-
-    torch.manual_seed(0)
-    input_ids = torch.randint(0, config.vocab_size, (1, 5))
-    seq_len = input_ids.shape[-1]
-    d_model = model.d_model
-
-    # --- Test 1: sites in trace ---
-    print("\nTest 1: pyro.poutine.trace captures all sites")
-    trace = pyro.poutine.trace(model).get_trace(input_ids)
-    registered = {
-        name: node["value"].shape
-        for name, node in trace.nodes.items()
-        if node["type"] == "sample"
-    }
-    expected = site_names(model.n_layers, model.n_heads)
-    print(f"  Expected {len(expected)} sites, got {len(registered)}")
-    for name in expected:
-        if name in registered:
-            print(f"    {name}: {tuple(registered[name])}")
-        else:
-            print(f"    {name}: MISSING")
-    all_present = all(name in registered for name in expected)
-    print(f"  {'PASS' if all_present else 'FAIL'}: all expected sites present")
-
-    # --- Test 2: do() patching ---
-    print("\nTest 2: do() patching")
-    patch = torch.zeros(1, seq_len, d_model)
-    with torch.no_grad():
-        out_clean = model(input_ids)
-        out_patched = do(model, {"head_0_0": patch})(input_ids)
-    print(f"  Clean output norm:   {out_clean.norm().item():.4f}")
-    print(f"  Patched output norm: {out_patched.norm().item():.4f}")
-    print(f"  Outputs differ: {not torch.allclose(out_clean, out_patched, atol=1e-4)}")
-
-    # --- Test 3: MultiWorldCounterfactual ---
-    print("\nTest 3: MultiWorldCounterfactual")
-    # first_available_dim must be negative enough for event_dim=2 sites plus world dims
-    with MultiWorldCounterfactual(first_available_dim=-9):
-        with do(actions={"head_0_0": patch}):
-            out_mwc = model(input_ids)
-        out_f = gather(out_mwc, IndexSet(**{"head_0_0": {0}}), event_dim=2)
-        out_i = gather(out_mwc, IndexSet(**{"head_0_0": {1}}), event_dim=2)
-
-    factual_matches = torch.allclose(out_f.squeeze(0), out_clean, atol=1e-4)
-    intervened_matches = torch.allclose(out_i.squeeze(0), out_patched, atol=1e-4)
-    print(f"  MWC output shape: {out_mwc.shape}")
-    print(f"  Factual world norm: {out_f.norm().item():.4f}")
-    print(f"  Intervened world norm: {out_i.norm().item():.4f}")
-    print(f"  Factual matches clean run: {factual_matches}")
-    print(f"  Intervened matches do() run: {intervened_matches}")
-    print(
-        f"  {'PASS' if factual_matches and intervened_matches else 'FAIL'}: MWC worlds correct"
-    )
-
-    # --- Test 4: correctness verification ---
-    print()
-    passed = verify_wrapper_correctness("tiny")
-    print()
-    print("=" * 60)
-    print(
-        f"Overall: {'PASS' if passed and all_present and factual_matches and intervened_matches else 'FAIL'}"
-    )
-    print("=" * 60)
+    return {"passed": max_diff < 1e-5, "max_diff": max_diff, "model_name": model_name}

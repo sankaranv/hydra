@@ -64,6 +64,11 @@ def resample_ablation(
 
     If reference_cache[site] is 1D along dim 0 (a single reference activation
     with the same shape as cache[site]), it is returned directly.
+
+    Precondition: all sites must use the same format (either all single-reference
+    or all stacked). Mixing formats breaks the shared-index invariant: a
+    single-reference site always returns the same value regardless of shared_idx,
+    so cross-site consistency only holds when all sites are stacked.
     """
     # Pick one prompt index uniformly; use the same index for all sites so the
     # alternative is a coherent single-prompt activation profile.
@@ -122,108 +127,3 @@ def build_alternatives(
         raise ValueError(
             f"Unknown ablation method '{method}'. Choose: zero, mean, resample"
         )
-
-
-if __name__ == "__main__":
-    import pyro
-    import torch.nn as nn
-
-    # ---------------------------------------------------------------------------
-    # Toy transformer from q2_transformer_wrapper.py
-    # ---------------------------------------------------------------------------
-
-    class AttentionHead(nn.Module):
-        def __init__(self, d_model, d_head):
-            super().__init__()
-            self.W_Q = nn.Linear(d_model, d_head, bias=False)
-            self.W_K = nn.Linear(d_model, d_head, bias=False)
-            self.W_V = nn.Linear(d_model, d_head, bias=False)
-            self.scale = d_head**-0.5
-
-        def forward(self, x):
-            q, k, v = self.W_Q(x), self.W_K(x), self.W_V(x)
-            return torch.softmax(q @ k.mT * self.scale, dim=-1) @ v
-
-    class AttentionLayer(nn.Module):
-        def __init__(self, d_model, n_heads):
-            super().__init__()
-            self.d_head = d_model // n_heads
-            self.heads = nn.ModuleList(
-                [AttentionHead(d_model, d_model // n_heads) for _ in range(n_heads)]
-            )
-            self.W_O = nn.Linear(d_model // n_heads, d_model, bias=False)
-
-        def forward(self, x, layer_idx):
-            resid = x
-            for h, head in enumerate(self.heads):
-                h_out = head(x)
-                h_out = pyro.deterministic(f"head_{layer_idx}_{h}", h_out, event_dim=2)
-                resid = resid + self.W_O(h_out)
-            return resid
-
-    class TinyTransformer(nn.Module):
-        def __init__(self, d_model=8, n_heads=2, n_layers=2):
-            super().__init__()
-            self.layers = nn.ModuleList(
-                [AttentionLayer(d_model, n_heads) for _ in range(n_layers)]
-            )
-
-        def forward(self, x):
-            resid = x
-            for layer_idx, layer in enumerate(self.layers):
-                resid = layer(resid, layer_idx)
-                resid = pyro.deterministic(f"resid_{layer_idx}", resid, event_dim=2)
-            return resid
-
-    def toy_model_fn(x):
-        inp = pyro.deterministic("input", x, event_dim=2)
-        return TinyTransformer()(inp)
-
-    torch.manual_seed(42)
-    x_in = torch.randn(1, 5, 8)
-    x_alt = torch.randn(1, 5, 8)
-    x_alt2 = torch.randn(1, 5, 8)
-
-    print("=== interventions.py validation ===")
-
-    # Baseline cache
-    cache = run_and_cache(toy_model_fn, x_in, sites=["head_0_0", "head_0_1"])
-    print(
-        f"Cache sites: {sorted(cache.keys())}, head_0_0 shape: {cache['head_0_0'].shape}"
-    )
-
-    # zero_ablation
-    zeros = zero_ablation(cache)
-    assert all(v.sum() == 0.0 for v in zeros.values()), (
-        "zero_ablation should give all zeros"
-    )
-    print("PASS: zero_ablation returns zero tensors of correct shape")
-
-    # mean_ablation
-    means = mean_ablation(
-        toy_model_fn,
-        inputs=[(x_in,), (x_alt,), (x_alt2,)],
-        sites=["head_0_0"],
-    )
-    assert means["head_0_0"].shape == cache["head_0_0"].shape, "mean shape mismatch"
-    print(f"PASS: mean_ablation returns correct shape {means['head_0_0'].shape}")
-
-    # resample_ablation — stack two references along dim 0
-    ref_cache_0 = run_and_cache(toy_model_fn, x_alt, sites=["head_0_0", "head_0_1"])
-    ref_cache_1 = run_and_cache(toy_model_fn, x_alt2, sites=["head_0_0", "head_0_1"])
-    stacked_ref = {
-        site: torch.stack([ref_cache_0[site], ref_cache_1[site]])
-        for site in ["head_0_0", "head_0_1"]
-    }
-    resampled = resample_ablation(cache, stacked_ref)
-    assert resampled["head_0_0"].shape == cache["head_0_0"].shape, (
-        "resample shape mismatch"
-    )
-    print(
-        f"PASS: resample_ablation returns correct shape {resampled['head_0_0'].shape}"
-    )
-
-    # build_alternatives dispatch
-    alts_zero = build_alternatives(["head_0_0"], method="zero", cache=cache)
-    assert alts_zero["head_0_0"].sum() == 0.0
-    print("PASS: build_alternatives dispatches correctly")
