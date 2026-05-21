@@ -90,3 +90,49 @@ def logit_diff_attribution(
         attributions[site] = abs(clean_diff - ablated_diff)
 
     return attributions
+
+
+def prefilter_candidates(
+    model_fn: Callable,
+    input_args: tuple,
+    candidate_sites: list[str],
+    top_k: int = 10,
+    correct_token_id: Optional[int] = None,
+    incorrect_token_id: Optional[int] = None,
+    logit_site: str = "logits",
+    ranking_fn: Optional[RankingFn] = None,
+) -> list[str]:
+    """Return the top_k most causally relevant sites from candidate_sites.
+
+    This is the main entry point for the pre-filter stage. Run before
+    train_ac_guide to restrict the expensive AC inference to a small set
+    of high-priority candidates.
+
+    Ranking priority:
+      1. ranking_fn (if provided) — applied to the activation cache
+      2. logit_diff_attribution (if correct_token_id and incorrect_token_id
+         are provided) — one zero-ablation pass per candidate site, no gradients
+      3. activation norm (fallback) — single forward pass, O(1) per site
+
+    Logit difference attribution is the recommended default: it measures how
+    much zero-ablating each site changes the logit_diff(correct, incorrect),
+    which is a linear approximation of causal influence on the output.
+    """
+    if ranking_fn is not None:
+        cache = run_and_cache(model_fn, *input_args, sites=candidate_sites)
+        return rank_candidates(cache, ranking_fn=ranking_fn, top_k=top_k)
+
+    if correct_token_id is not None and incorrect_token_id is not None:
+        scores = logit_diff_attribution(
+            model_fn,
+            input_args,
+            candidate_sites,
+            correct_token_id=correct_token_id,
+            incorrect_token_id=incorrect_token_id,
+            logit_site=logit_site,
+        )
+        return sorted(scores, key=lambda s: (-scores[s], s))[:top_k]
+
+    # Activation norm fallback: single forward pass, no token IDs required.
+    cache = run_and_cache(model_fn, *input_args, sites=candidate_sites)
+    return rank_candidates(cache, top_k=top_k)

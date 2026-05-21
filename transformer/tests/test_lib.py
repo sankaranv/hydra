@@ -21,7 +21,11 @@ from transformer.lib.interventions import (
     zero_ablation,
 )
 from transformer.lib.model import HookedGPT2, check_do_hook_equivalence, site_names
-from transformer.lib.prefilter import logit_diff_attribution, rank_candidates
+from transformer.lib.prefilter import (
+    logit_diff_attribution,
+    prefilter_candidates,
+    rank_candidates,
+)
 from transformer.lib.verdict import (
     compute_necessity,
     compute_pns,
@@ -408,3 +412,107 @@ def test_check_do_hook_equivalence_tiny():
         f"max_diff={result['max_diff']:.2e} — do() and hook disagree"
     )
     assert result["max_diff"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# prefilter.py tests — prefilter_candidates
+# ---------------------------------------------------------------------------
+
+
+def test_prefilter_candidates_logit_diff(model_fn, x_in):
+    sites = ["head_0_0", "head_0_1", "head_1_0", "head_1_1"]
+    ranked = prefilter_candidates(
+        model_fn,
+        (),
+        sites,
+        top_k=2,
+        correct_token_id=0,
+        incorrect_token_id=1,
+        logit_site="logits",
+    )
+    assert len(ranked) == 2
+    assert all(s in sites for s in ranked)
+
+
+def test_prefilter_candidates_activation_norm_fallback(model_fn, x_in):
+    sites = ["head_0_0", "head_0_1", "head_1_0", "head_1_1"]
+    ranked = prefilter_candidates(model_fn, (), sites, top_k=3)
+    assert len(ranked) == 3
+    assert all(s in sites for s in ranked)
+
+
+def test_prefilter_candidates_custom_ranking_fn(model_fn, x_in):
+    sites = ["head_0_0", "head_0_1", "head_1_0", "head_1_1"]
+
+    def constant_fn(cache):
+        # Reverse-alphabetical to verify custom fn is used
+        return {name: -ord(name[-1]) for name in cache}
+
+    ranked = prefilter_candidates(model_fn, (), sites, top_k=4, ranking_fn=constant_fn)
+    assert ranked == sorted(sites, key=lambda s: ord(s[-1]))
+
+
+# ---------------------------------------------------------------------------
+# batch.py tests — batch_ac_queries
+# ---------------------------------------------------------------------------
+
+
+def test_batch_ac_queries_returns_pns_per_prompt(tiny_model, x_in):
+    """batch_ac_queries collects one PNS value per prompt per site."""
+    from transformer.lib.batch import batch_ac_queries
+
+    def make_spec(x):
+        def mfn():
+            inp = pyro.deterministic("input", x, event_dim=2)
+            out = tiny_model(inp)
+            return pyro.deterministic("logits", out, event_dim=2)
+
+        cache = run_and_cache(mfn, sites=["head_0_0", "logits"])
+        return {
+            "model_fn": mfn,
+            "antecedents": {"head_0_0": cache["head_0_0"]},
+            "alternatives": zero_ablation({"head_0_0": cache["head_0_0"]}),
+            "witnesses": {},
+            "consequent_site": "logits",
+            "consequent_value": cache["logits"],
+        }
+
+    torch.manual_seed(0)
+    specs = [make_spec(torch.randn(1, 5, 8)) for _ in range(3)]
+    result = batch_ac_queries(specs, n_steps=50, consequent_scale=0.1)
+
+    assert "head_0_0" in result
+    assert len(result["head_0_0"]) == 3
+    assert all(v == v for v in result["head_0_0"]), "NaN in batch PNS values"
+
+
+def test_batch_ac_queries_missing_site_is_nan(tiny_model, x_in):
+    """Sites absent from a prompt's antecedents produce nan for that prompt."""
+    from transformer.lib.batch import batch_ac_queries
+    import math
+
+    def make_spec(x, site):
+        def mfn():
+            inp = pyro.deterministic("input", x, event_dim=2)
+            out = tiny_model(inp)
+            return pyro.deterministic("logits", out, event_dim=2)
+
+        cache = run_and_cache(mfn, sites=[site, "logits"])
+        return {
+            "model_fn": mfn,
+            "antecedents": {site: cache[site]},
+            "alternatives": zero_ablation({site: cache[site]}),
+            "witnesses": {},
+            "consequent_site": "logits",
+            "consequent_value": cache["logits"],
+        }
+
+    torch.manual_seed(1)
+    x0, x1 = torch.randn(1, 5, 8), torch.randn(1, 5, 8)
+    # Prompt 0 queries head_0_0; prompt 1 queries head_0_1
+    specs = [make_spec(x0, "head_0_0"), make_spec(x1, "head_0_1")]
+    result = batch_ac_queries(specs, n_steps=30, consequent_scale=0.1)
+
+    # head_0_0 is absent from prompt 1 → nan; head_0_1 absent from prompt 0 → nan
+    assert math.isnan(result["head_0_0"][1])
+    assert math.isnan(result["head_0_1"][0])
