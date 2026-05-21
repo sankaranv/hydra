@@ -1,48 +1,19 @@
 """
-GPT-2 wrapper with pyro.deterministic sites for ChiRho interventions.
+Model wrappers with pyro.deterministic sites for ChiRho interventions.
 
-Architecture overview
----------------------
-GPT-2 uses Conv1D internally and its original attention forward relies on
-.split(dim=2) and .transpose(1, 2), which hardcode absolute tensor dimensions.
-When ChiRho's MultiWorldCounterfactual injects leading world dimensions these
-calls break. Additionally, GPT2Model.forward calls hidden_states.view(-1, ...) at
-the end, which collapses world and batch dimensions.
+This module is the public entry point for all hooked model wrappers. Implementation
+lives in transformer.lib.models.*; this module re-exports the public API and provides
+backward-compatible access to HookedGPT2, check_do_hook_equivalence, and site_names.
 
-Fixes applied
--------------
-1. world_safe_attention_forward: replaces GPT2Attention.forward with an equivalent
-   that uses only relative dimensions (dim=-1, transpose(-3, -2)) and avoids
-   calling eager_attention_forward (whose internal transpose(1, 2) is also absolute).
-   All models are loaded with attn_implementation='eager' to ensure a single code path.
+Supported model families
+------------------------
+    HookedGPT2     — GPT-2 (Conv1D, absolute-dim fixes in attention forward)
+    HookedGPTNeoX  — Pythia / GPT-NeoX (combined QKV, parallel residual, RoPE)
+    HookedLlama    — Llama 3.1 and Qwen2.5 (separate QKV projections, GQA, RoPE)
+    HookedModel    — factory: auto-detects model family from config.model_type
 
-2. HookedGPT2.forward: runs the transformer step-by-step instead of delegating to
-   GPT2Model.forward, skipping its final hidden_states.view(-1, seq, d) which would
-   merge world and batch dimensions.
-
-Sites registered
-----------------
-For each layer L in range(n_layers):
-    head_{L}_{H}  : per-head contribution to residual stream, shape [*batch, seq, d_model]
-                    computed as pre_proj[..., H*d_head:(H+1)*d_head] @ W_proj[H*d_head:, :]
-                    where W_proj is c_proj.weight ([d_model, d_model] Conv1D convention).
-    attn_out_{L}  : full attention output = sum of head contributions + c_proj bias,
-                    shape [*batch, seq, d_model]. Registered BEFORE resid_dropout;
-                    in eval mode dropout is identity, but patching attn_out_L during
-                    training affects the pre-dropout value, not the residual contribution.
-    mlp_out_{L}   : MLP output, shape [*batch, seq, d_model].
-    resid_post_{L}: residual stream after block L =
-                    resid_pre_L + resid_dropout(attn_out_L) + mlp_out_L,
-                    shape [*batch, seq, d_model].
-
-resid_pre_0 = embedding (token + position), registered as resid_post_{-1} is not exposed.
-resid_pre_L for L > 0 is identical to resid_post_{L-1}.
-
-Design choice: head sites have shape [*batch, seq, d_model], not [*batch, seq, d_head].
-Each head H produces a full-rank contribution via c_proj weight slice [d_head, d_model];
-registering the d_model-shaped result means patching head_L_H is a semantically clean
-intervention that replaces head H's entire causal contribution to the residual stream.
-event_dim=2 throughout because [seq, d_model] is the natural event tensor.
+All wrappers register identical site names for each layer L:
+    resid_pre_0, head_{L}_{H}, attn_out_{L}, mlp_out_{L}, resid_post_{L}
 """
 
 import types
@@ -53,6 +24,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GPT2Config, GPT2Model
+
+# Re-export new model wrappers for callers that import from transformer.lib.model.
+# HookedGPT2 is defined later in this file (not imported) for backward compatibility.
+from transformer.lib.models.factory import HookedModel  # noqa: F401
+from transformer.lib.models.gpt_neox import HookedGPTNeoX  # noqa: F401
+from transformer.lib.models.llama import HookedLlama  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
