@@ -21,15 +21,24 @@ def batch_ac_queries(
     Each element of prompt_specs is a dict with keys:
       model_fn         Callable — zero-argument closure over the prompt's input
       antecedents      dict[str, Tensor] — site → observed activation value
-      alternatives     dict[str, Tensor] — site → alternative (e.g. zero-ablated)
+      alternatives     dict[str, Tensor] — site → alternative activation value;
+                       construct with zero_ablation(), mean_ablation(), or
+                       resample_ablation() from transformer.lib.interventions
       consequent_site  str — name of the logit/output site
       consequent_value Tensor — observed value of the consequent site
       witnesses        dict[str, None] | None (optional, defaults to {})
 
+    The choice of ablation method determines what "necessity" means for each
+    query: zero_ablation tests "would the consequent change if this site
+    contributed nothing?"; mean_ablation uses the average activation as the
+    counterfactual baseline; resample_ablation draws a coherent activation
+    profile from a reference distribution. All three are valid — pick based on
+    the scientific question.
+
     Returns dict[site_name → list[float]] where each list has one PNS entry per
     prompt. Sites absent from a prompt's antecedents produce nan for that prompt.
     Use to assess how consistently a site is causal across a prompt distribution:
-      mean_pns = {site: sum(v for v in vals if v == v) / len(vals)
+      mean_pns = {site: sum(v for v in vals if not math.isnan(v)) / len(vals)
                   for site, vals in result.items()}
     """
     all_sites: set[str] = set()
