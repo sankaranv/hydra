@@ -1,4 +1,4 @@
-"""Phase 4: end-to-end AC pipeline with SVI guide on a planted causal structure.
+"""Phase 4: end-to-end AC pipeline with IS guide on a planted causal structure.
 
 Ground truth model: logits = W @ head_0_0, head_0_1 is always zero and disconnected
 from the output. Under this structure:
@@ -8,12 +8,18 @@ from the output. Under this structure:
     unchanged).
 
 The test verifies that train_ac_guide + read_guide_verdict correctly identifies
-head_0_0 as a high-PNS, high-sufficiency cause and head_0_1 as a low-PNS non-cause.
-This validates that the sufficiency world fires reliably — unlike raw run_ac_query
-which samples case values from the prior (uniformly) and gives ~2/3 PNS everywhere.
+head_0_0 as a high-PNS cause and head_0_1 as a low-PNS non-cause.
+
+This validates the IS-based PNS estimator: for a causal site, the necessity world
+fires with finite log_prob (ablation changes the consequent), concentrating IS weight
+on case=0 samples and giving P(case=0) > 0.5. For a non-causal site, all worlds have
+-inf log_prob (ablation leaves the consequent unchanged), triggering the all-inf
+fallback which returns P(case=0) ≈ 0.
 
 Run with: pytest transformer/tests/test_phase4.py -v
 """
+
+import math
 
 import pyro
 import pytest
@@ -82,18 +88,17 @@ def _make_model_fn(planted, x):
 
 
 def test_guide_causal_head_has_high_pns(planted, x_planted):
-    """head_0_0 must have PNS > 0.5 after guide training.
+    """head_0_0 must have PNS > 0.5 after IS estimation.
 
-    PNS = P(case=0 | evidence) where case=0 means the antecedent intervention is
-    NOT preempted (the causal world is active). For the causal head, both necessity
-    and sufficiency worlds explain the evidence well, so the guide concentrates
-    mass on case=0 for head_0_0.
+    For the causal head, the necessity world fires with finite log_prob (ablating
+    head_0_0 drives logits to 0, which differs from the observed logits). IS
+    concentrates weight on case=0 (intervention active) samples, giving high PNS.
     """
     model_fn = _make_model_fn(planted, x_planted)
     cache = run_and_cache(model_fn, sites=["head_0_0", "logits"])
     alts = zero_ablation({"head_0_0": cache["head_0_0"]})
 
-    train_ac_guide(
+    _, pns = train_ac_guide(
         model_fn,
         antecedents={"head_0_0": cache["head_0_0"]},
         alternatives=alts,
@@ -111,9 +116,8 @@ def test_guide_causal_head_has_high_pns(planted, x_planted):
         # to cleanly separate necessity (logits→0) from factual (logits unchanged).
         consequent_scale=1.0,
         n_steps=300,
-        lr=0.05,
     )
-    verdict = read_guide_verdict(["head_0_0"])
+    verdict = read_guide_verdict(["head_0_0"], pns)
 
     assert verdict["head_0_0"]["pns"] > 0.5, (
         f"Expected PNS > 0.5 for causal head, got {verdict['head_0_0']['pns']:.3f}"
@@ -126,7 +130,7 @@ def test_guide_noncausal_head_has_low_pns(planted, x_planted):
     cache = run_and_cache(model_fn, sites=["head_0_1", "logits"])
     alts = zero_ablation({"head_0_1": cache["head_0_1"]})
 
-    train_ac_guide(
+    _, pns = train_ac_guide(
         model_fn,
         antecedents={"head_0_1": cache["head_0_1"]},
         alternatives=alts,
@@ -136,9 +140,8 @@ def test_guide_noncausal_head_has_low_pns(planted, x_planted):
         event_dim=2,
         consequent_scale=1.0,
         n_steps=300,
-        lr=0.05,
     )
-    verdict = read_guide_verdict(["head_0_1"])
+    verdict = read_guide_verdict(["head_0_1"], pns)
 
     assert verdict["head_0_1"]["pns"] < 0.3, (
         f"Expected PNS < 0.3 for non-causal head, got {verdict['head_0_1']['pns']:.3f}"
@@ -152,7 +155,7 @@ def test_guide_ranks_causal_above_noncausal(planted, x_planted):
     alts_h0 = zero_ablation({"head_0_0": cache["head_0_0"]})
     alts_h1 = zero_ablation({"head_0_1": cache["head_0_1"]})
 
-    train_ac_guide(
+    _, pns_h0_dict = train_ac_guide(
         model_fn,
         antecedents={"head_0_0": cache["head_0_0"]},
         alternatives=alts_h0,
@@ -162,11 +165,10 @@ def test_guide_ranks_causal_above_noncausal(planted, x_planted):
         event_dim=2,
         consequent_scale=1.0,
         n_steps=300,
-        lr=0.05,
     )
-    pns_h0 = read_guide_verdict(["head_0_0"])["head_0_0"]["pns"]
+    pns_h0 = read_guide_verdict(["head_0_0"], pns_h0_dict)["head_0_0"]["pns"]
 
-    train_ac_guide(
+    _, pns_h1_dict = train_ac_guide(
         model_fn,
         antecedents={"head_0_1": cache["head_0_1"]},
         alternatives=alts_h1,
@@ -176,17 +178,14 @@ def test_guide_ranks_causal_above_noncausal(planted, x_planted):
         event_dim=2,
         consequent_scale=1.0,
         n_steps=300,
-        lr=0.05,
     )
-    pns_h1 = read_guide_verdict(["head_0_1"])["head_0_1"]["pns"]
+    pns_h1 = read_guide_verdict(["head_0_1"], pns_h1_dict)["head_0_1"]["pns"]
 
-    assert pns_h0 > pns_h1, (
-        f"Expected PNS(h0_0)={pns_h0:.3f} > PNS(h0_1)={pns_h1:.3f}"
-    )
+    assert pns_h0 > pns_h1, f"Expected PNS(h0_0)={pns_h0:.3f} > PNS(h0_1)={pns_h1:.3f}"
 
 
 def test_guide_is_sampling_succeeds(planted, x_planted):
-    """IS estimation completes without NaN and stores a valid PNS in param_store.
+    """IS estimation completes without NaN and stores a valid PNS in pns_dict.
 
     Replaces the SVI loss-decrease test: IS does not train a guide iteratively,
     so there are no losses to decrease. Instead, we verify that the IS sampling
@@ -197,7 +196,7 @@ def test_guide_is_sampling_succeeds(planted, x_planted):
     cache = run_and_cache(model_fn, sites=["head_0_0", "logits"])
     alts = zero_ablation({"head_0_0": cache["head_0_0"]})
 
-    _, log_probs = train_ac_guide(
+    log_probs, pns = train_ac_guide(
         model_fn,
         antecedents={"head_0_0": cache["head_0_0"]},
         alternatives=alts,
@@ -207,17 +206,16 @@ def test_guide_is_sampling_succeeds(planted, x_planted):
         event_dim=2,
         consequent_scale=1.0,
         n_steps=100,
-        lr=0.05,
     )
 
     assert len(log_probs) == 100
-    # NaN check: NaN != NaN in IEEE 754; any NaN means the IS loop is broken.
-    assert all(lp == lp for lp in log_probs), "IS sampling produced NaN log_probs"
+    assert all(not math.isnan(lp) for lp in log_probs), (
+        "IS sampling produced NaN log_probs"
+    )
     # For the causal head (head_0_0), case=0 necessity world fires with logits→0,
     # giving finite log_prob. At least some samples must be finite.
     assert any(lp > float("-inf") for lp in log_probs), (
         "All log_probs are -inf for causal head — necessity world did not fire"
     )
-    verdict = read_guide_verdict(["head_0_0"])
-    pns = verdict["head_0_0"]["pns"]
-    assert pns == pns, "PNS is NaN after IS estimation"  # NaN check
+    verdict = read_guide_verdict(["head_0_0"], pns)
+    assert not math.isnan(verdict["head_0_0"]["pns"]), "PNS is NaN after IS estimation"
